@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+# vim:set sw=4 ts=4 et cin ai syntax=python:
+
+import argparse
+import asyncio
+import getpass
+import json
+import logging
+import logging.handlers
+import os
+import re
+import sys
+import traceback
+
+from nio import (
+    AsyncClient,
+    AsyncClientConfig,
+    JoinedMembersError,
+    JoinedRoomsError,
+    LoginResponse,
+    EnableEncryptionBuilder,
+    MatrixRoom,
+    RoomCreateError,
+    RoomInviteError,
+    RoomKickError,
+    RoomMemberEvent,
+    RoomMessage,
+    RoomMessageNotice,
+    RoomMessageText,
+    SyncResponse
+)
+from systemd import journal
+from yt_dlp import YoutubeDL
+from threading import Thread
+from queue import Queue, Empty
+from dataclasses import dataclass, field
+
+
+PROG_WITHOUT_EXT = os.path.splitext(os.path.basename(__file__))[0]
+CONFIG_FILE = os.path.expanduser(os.getenv('CONFIG_FILE') or '~/.config/matrix-ytdl.json')
+SYNC_FILE = os.path.expanduser(os.getenv('SYNC_FILE') or '~/.cache/matrix-ytdl.since')
+
+class DummyLogger:
+    def debug(self, msg):
+        pass
+
+    def info(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        print(f'err: {msg}')
+
+class Callbacks(object):
+    """Class to pass client to callback methods."""
+
+    def __init__(self, client, config):
+        """Store AsyncClient."""
+        self.client = client
+        self.config = config
+
+    async def sendroom(self, msg):
+        if msg is None:
+            return
+        logger.debug(f'sending {msg}')
+        await self.client.room_send(
+            room_id = self.config['roomid'],
+            message_type = 'm.room.message',
+            content = {
+                'msgtype': 'm.text',
+                'body': msg
+            }
+        )
+
+    async def sync_callback(self, response):
+        with open(SYNC_FILE, 'w') as sf:
+            sf.write(response.next_batch)
+        msg = dl.getdone()
+        if not msg is None:
+            await self.sendroom(msg)
+
+    async def message_callback(self, room: MatrixRoom, event):
+        try:
+            logger.debug(
+                f'message_callback(): for room {room} received this '
+                f'event: type: {type(event)}, event_id: {event.event_id}'
+            )
+
+            if event.sender == self.client.user_id:
+                try:
+                    logger.debug(
+                        f'Skipping message sent by myself: {event.body}'
+                    )
+                    return
+                except AttributeError:  # does not have .body
+                    logger.debug(
+                        f'Skipping message sent by myself: {event}'
+                    )
+                    return
+
+            if isinstance(event, RoomMessageNotice) or isinstance(event, RoomMessageText):
+                msg = event.body  # Extract the message text
+                if msg == 'status':
+                    await self.sendroom(dl.status())
+                    return
+                if msg.startswith('status https://'):
+                    await self.sendroom(dl.status(msg[7:]))
+                    return
+                if msg.startswith('https://'):
+                    dl.add(msg, self.config['dstdir'])
+                    await self.sendroom(f'Queued download of {msg}')
+                    return
+            elif isinstance(event, RoomMemberEvent):
+                if event.membership == 'leave':
+                    remove_member(event.sender)
+                return
+            else:
+                msg = f'Received unknown event: {event}'
+
+            event_id_detail = f' | id {event.event_id} | ts {event.server_timestamp}'
+            complete_msg = (
+                f'Message received for room {room.room_id} | '
+                f'sender {event.sender}'
+                f'{event_id_detail} | {msg}'
+            )
+            logger.info(complete_msg)
+        except BaseException:
+            logger.warning(traceback.format_exc())
+
+class Ytdl():
+
+    @dataclass
+    class QueueElement:
+        url: str
+        done: Queue
+        dstdir: str = field(default = '~/Downloads')
+        percent: str = field(default = '0 %')
+        status: str = field(default = 'pending')
+        path: str = field(default = 'unknown')
+        dlopts: dict = field(default_factory = dict)
+
+        def __post_init__(self):
+            dstdir = self.dstdir or '~/Downloads'
+            self.dlopts = {
+                'quiet': True,
+                'format': 'bv+ba',
+                'merge_output_format': 'mkv',
+                'outtmpl': {'default': dstdir + '/%(title)s.%(ext)s'},
+                'logger': DummyLogger(),
+                'progress_hooks': [self.hook],
+                'postprocessor_hooks': [self.phook]
+            }
+
+        def hook(self, d):
+            status = d.get('status') 
+            percent = d.get('_percent_str')
+            id = d.get('info_dict')
+            if not id is None and not id.get('_filename') is None:
+                self.path = id.get('_filename')
+            if not percent is None:
+                self.percent = percent
+            self.status = status
+
+        def phook(self, d):
+            status = d.get('status')
+            percent = d.get('_percent_str')
+            id = d.get('info_dict')
+            if not id is None and not id.get('_filename') is None:
+                self.path = id.get('_filename')
+            if not percent is None:
+                self.percent = percent
+            self.status = status
+            if status == 'finished':
+                el = {
+                    'url': self.url,
+                    'path': self.path
+                }
+                self.done.put(el)
+
+    def __init__(self):
+        self.queue = Queue()
+        self.loading = Queue()
+        self.done = Queue()
+
+    def add(self, url, dstdir = None):
+        el = self.QueueElement(url, self.done, dstdir)
+        self.queue.put(el, block=False)
+
+    def getdone(self):
+        ret = None
+        while True:
+            try:
+                el = self.done.get(block = False)
+                url = el['url']
+                path = el['path']
+                file = os.path.basename(path)
+                if ret is None:
+                    ret = f'Finished download of {url}\n to {file}'
+                else:
+                    ret += f'\nFinished download of {url}\n to {file}'
+            except Empty:
+                return ret
+
+    def status(self, url=None):
+        if url is None:
+            ecount = 0
+            try:
+                el = self.queue.queue[0]
+                if el.status == 'pending' and not el.url is None:
+                    return f'Pending download of {el.url}'
+            except IndexError:
+                ecount += 1
+            try:
+                el = self.loading.queue[0]
+                file = os.path.basename(el.path)
+                if el.status == 'downloading':
+                    return f'Downloading {el.percent} of {el.url} to {file}'
+                elif el.status == 'finished':
+                    return f'Finished download of {el.url} to {file}'
+            except IndexError:
+                ecount += 1
+            if ecount == 2:
+                return 'Download queue is empty'
+        else:
+            allqueues = list(self.queue.queue) + list(self.loading.queue)
+            for el in allqueues:
+                if el.url == url:
+                    return f'{el.status}: {el.url}'
+            return 'Not found'
+
+    def worker(self):
+        try:
+            while True:
+                el = self.queue.get()
+                if el.url is None:
+                    return
+                self.loading.put(el)
+                with YoutubeDL(el.dlopts) as ydl:
+                    ydl.download(el.url)
+                    self.loading.get()
+        except KeyboardInterrupt:
+            return
+
+def write_details_to_disk(resp: LoginResponse, homeserver, room, dstdir) -> None:
+    """Writes the required login details to disk so we can log in later without
+    using a password.
+
+    Arguments:
+        resp {LoginResponse} -- the successful client login response.
+        homeserver -- URL of homeserver, e.g. "https://matrix.example.org"
+    """
+    # open the config file in write-mode
+    with open(CONFIG_FILE, 'w') as f:
+        # write the login details to disk
+        json.dump(
+            {
+                "homeserver": homeserver,  # e.g. "https://matrix.example.org"
+                "user_id": resp.user_id,  # e.g. "@user:example.org"
+                "device_id": resp.device_id,  # device ID, 10 uppercase letters
+                "access_token": resp.access_token,  # cryptogr. access token
+                "room": room,  # Room name resp. alias
+                "dstdir": dstdir,
+                "members": []
+            },
+            f,
+            indent = 4
+        )
+
+def update_config(config) -> None:
+    with open(CONFIG_FILE, 'r') as f:
+        tmp = json.load(f)
+        for attr, value in config.__dict__.items():
+            tmp[attr] = value
+        with open(CONFIG_FILE, 'w') as nf:
+            json.dump(tmp, nf, indent = 4)
+
+def remove_member(userid) -> None:
+    with open(CONFIG_FILE, 'r') as f:
+        tmp = json.load(f)
+        if userid in tmp['members']:
+            logger.info(f'Removing member {userid}')
+            tmp['members'].remove(userid)
+        with open(CONFIG_FILE, 'w') as nf:
+            json.dump(tmp, nf, indent = 4)
+
+async def listen_forever(client: AsyncClient, config) -> None:
+    """Listen forever or until Control-C."""
+    # Set up event callbacks
+    callbacks = Callbacks(client, config)
+    client.add_event_callback(
+        callbacks.message_callback,
+        (
+            RoomMessage,
+            RoomMemberEvent,
+        ),
+    )
+    since = None
+    try:
+        with open (SYNC_FILE, 'r') as sf:
+            since = sf.read()
+    except:
+        since = None
+    client.add_response_callback(callbacks.sync_callback, SyncResponse)
+    await client.sync_forever(timeout=1000, full_state=True, since=since)
+
+async def main(dl) -> None:
+    client = None
+    try:
+        # If there are no previously-saved credentials, we'll use the password
+        ccfg = AsyncClientConfig(store_sync_tokens=True)
+        if not os.path.exists(CONFIG_FILE):
+            print(f'First time use. Did not find {CONFIG_FILE}. Asking for '
+                'homeserver, user, and password to create credential file.')
+            homeserver = 'https://matrix.example.org'
+            homeserver = input(f'Enter your homeserver URL: [{homeserver}] ')
+
+            if not (homeserver.startswith('https://')
+                    or homeserver.startswith('http://')):
+                homeserver = 'https://' + homeserver
+            svpart = re.sub('^(http)s?://([^/]+).*$', r'\2', homeserver)
+
+            user_id = f'@ytdl:{svpart}'
+            user_id = input(f'Enter your full user ID: [{user_id}] ') or user_id
+
+            device_name = 'matrix-ytdl'
+            device_name = input(f'Choose a name for this device: [{device_name}] ') or device_name
+
+            room_name = 'ytdl'
+            room_name = input(f'Choose a room name: [{room_name}] ') or room_name
+
+            dstdir = '~/Downloads'
+            dstdir = input(f'Choose a destination directory: [{dstdir}] ') or dstdir
+
+            client = AsyncClient(homeserver, user_id)
+            pw = getpass.getpass()
+
+            resp = await client.login(pw, device_name=device_name)
+
+            # check that we logged in succesfully
+            if (isinstance(resp, LoginResponse)):
+                write_details_to_disk(resp, homeserver, room_name, dstdir)
+            else:
+                logger.error(f'Login failed at {homeserver} as "{user_id}": {resp}')
+                sys.exit(1)
+
+            logger.info(f'Logged in using a password. Credentials stored in "{CONFIG_FILE}"')
+
+        # Otherwise the config file exists, so we'll use the stored credentials
+        else:
+            # open the file in read-only mode
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+                client = AsyncClient(config['homeserver'])
+
+                client.access_token = config['access_token']
+                client.user_id = config['user_id']
+                client.device_id = config['device_id']
+
+                resp = await client.joined_rooms()
+                if isinstance(resp, JoinedRoomsError):
+                    logger.error(f'Could not get joined rooms: {resp}')
+                    logger.error(f'Please remove the file {CONFIG_FILE} and start a first-time configuration')
+                    sys.exit(1)
+                logger.info('Logged in using stored credentials.')
+
+                if config.get('roomid') is None:
+                    resp = await client.room_create(alias = config['room'], name = config['room'],
+                        topic = '', initial_state = [EnableEncryptionBuilder().as_dict()])
+                    if isinstance(resp, RoomCreateError):
+                        logger.error(f'Could not create room: {resp}')
+                        sys.exit(1)
+                    logger.info(f'Room "{config["room"]}" created, id = {resp.room_id}')
+                    config['roomid'] = resp.room_id
+                    update_config(config)
+                resp = await client.joined_members(config['roomid'])
+                if isinstance(resp, JoinedMembersError):
+                    logger.error(f'Could not determine members of room: {resp}')
+                    sys.exit(1)
+                joined = []
+                for m in resp.members:
+                    if m.user_id != client.user_id:
+                        joined.append(m.user_id)
+                for uid in joined:
+                        if not uid in config['members']:
+                            logger.info(f'Removing {uid} from room')
+                            resp = await client.room_kick(config['roomid'], uid)
+                            if isinstance(resp, RoomKickError):
+                                logger.error(f'Could not kick {uid}: {resp}')
+                            else:
+                                joined.remove(uid)
+                for uid in config['members']:
+                    if not uid in joined:
+                        logger.info(f'Inviting {uid}')
+                        resp = await client.room_invite(config['roomid'], uid)
+                        if isinstance(resp, RoomInviteError):
+                            logger.error(f'Could not invite {uid}: {resp}')
+                        else:
+                            joined.append(uid)
+
+                logger.info('Waiting for messages ...')
+                logger.debug(f'client={client}')
+                await listen_forever(client, config)
+    finally:
+        if client:
+            await client.close()
+
+def initial_check_of_log_args() -> str:
+    """Check logging related arguments."""
+    if not pargs.log_level:
+        return
+    t = ''
+    for i in range(len(pargs.log_level)):
+        up = pargs.log_level[i].upper()
+        pargs.log_level[i] = up
+        if up not in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
+            t = (
+                '--log-level only allows values DEBUG, INFO, WARNING, '
+                'ERROR, or CRITICAL. --log-level argument incorrect. '
+                f'({up})'
+            )
+    if t == '':
+        return
+    else:
+        logger.error(t)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(
+        description = 'A matrix bot for downloading YouTube videos',
+        formatter_class = argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        '-d',
+        '--debug',
+        action='count',
+        default=0,
+        help='Print debug information. If used once, only the log level of '
+        f'{PROG_WITHOUT_EXT} is set to DEBUG. '
+        'If used twice ("-d -d" or "-dd") then '
+        f'log levels of both {PROG_WITHOUT_EXT} and underlying modules are '
+        'set to DEBUG. "-d" is a shortcut for "--log-level DEBUG". '
+        'See also --log-level. "-d" takes precedence over "--log-level". ',
+    )
+    ap.add_argument(
+        '--log-level',
+        required=False,
+        action='extend',
+        nargs='+',
+        type=str,
+        help='Set the log level(s). Possible values are '
+        'DEBUG, INFO, WARNING, ERROR, and CRITICAL. '
+        'If --log_level is used with one level argument, only the log level '
+        f'of {PROG_WITHOUT_EXT} is set to the specified value. '
+        'If --log_level is used with two level argument '
+        '(e.g. "--log-level WARNING ERROR") then '
+        f'log levels of both {PROG_WITHOUT_EXT} and underlying modules are '
+        'set to the specified values. '
+        'See also --debug.',
+    )
+
+    # Setup logging
+    logger = logging.getLogger(PROG_WITHOUT_EXT)
+    logger.setLevel(logging.INFO)
+    if os.getenv('SYSTEMD_EXEC_PID') != str(os.getpid()):
+        # If not running in systemd, use stderr
+        log_format = '%(asctime)s %(levelname)-8s %(message)s'
+        formatter = logging.Formatter(log_format)
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    else:
+        # If running in systemd, use syslog
+        log_format = '%(message)s'
+        formatter = logging.Formatter(log_format)
+        handler = journal.JournalHandler(SYSLOG_IDENTIFIER = 'matrix-ytdl')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    pargs = ap.parse_args()
+    if pargs.log_level:
+        initial_check_of_log_args()
+        if len(pargs.log_level) > 0:
+            if len(pargs.log_level) > 1:
+                # set log level for EVERYTHING
+                logging.getLogger().setLevel(pargs.log_level[1])
+            # set log level for matrix-ytdl
+            logger.setLevel(pargs.log_level[0])
+            logger.debug(
+                f'Log level is set for module {PROG_WITHOUT_EXT}. '
+                f'log_level={pargs.log_level[0]}'
+            )
+            if len(pargs.log_level) > 1:
+                # only now that local log level is set, we can log prev. info
+                logger.debug(
+                    f'Log level is set for modules below {PROG_WITHOUT_EXT}. '
+                    f'log_level={pargs.log_level[1]}'
+                )
+    if pargs.debug > 0:
+        if pargs.debug > 1:
+            # turn on debug logging for EVERYTHING
+            logging.getLogger().setLevel(logging.DEBUG)
+        # turn on debug logging for matrix-ytdl
+        logger.setLevel(logging.DEBUG)
+        logger.debug(f'Debug is turned on. debug count={pargs.debug}')
+        if pargs.log_level and len(pargs.log_level) > 0:
+            logger.warning('Debug option -d overwrote option --log-level.')
+
+    global dl
+    dl = Ytdl()
+    thr = Thread(target = dl.worker)
+    thr.start()
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main(dl))
+    except KeyboardInterrupt:
+        logger.info('shutting down')
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        dl.add(None)
+        thr.join()
+    sys.exit(0)
