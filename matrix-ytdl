@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 
 
 PROG_WITHOUT_EXT = os.path.splitext(os.path.basename(__file__))[0]
+IN_SYSTEMD = os.getenv('SYSTEMD_EXEC_PID') == str(os.getpid())
 CONFIG_FILE = os.path.expanduser(os.getenv('CONFIG_FILE') or '~/.config/matrix-ytdl.json')
 SYNC_FILE = os.path.expanduser(os.getenv('SYNC_FILE') or '~/.cache/matrix-ytdl.since')
 
@@ -172,7 +173,7 @@ class Ytdl():
             if not percent is None:
                 self.percent = percent
             self.status = status
-            if status == 'finished':
+            if status == 'finished' and d['postprocessor'] == 'MoveFiles':
                 el = {
                     'url': self.url,
                     'path': self.path
@@ -186,12 +187,12 @@ class Ytdl():
 
     def add(self, url, dstdir = None):
         el = self.QueueElement(url, self.done, dstdir)
-        self.queue.put(el, block=False)
+        self.queue.put(el)
 
     def getdone(self):
         ret = None
-        while True:
-            try:
+        try:
+            while True:
                 el = self.done.get(block = False)
                 url = el['url']
                 path = el['path']
@@ -200,8 +201,8 @@ class Ytdl():
                     ret = f'Finished download of {url}\n to {file}'
                 else:
                     ret += f'\nFinished download of {url}\n to {file}'
-            except Empty:
-                return ret
+        except Empty:
+            return ret
 
     def status(self, url=None):
         if url is None:
@@ -308,9 +309,17 @@ async def listen_forever(client: AsyncClient, config) -> None:
 async def main(dl) -> None:
     client = None
     try:
-        # If there are no previously-saved credentials, we'll use the password
-        ccfg = AsyncClientConfig(store_sync_tokens=True)
+        # If there are no previously-saved credentials, we interactively ask
+        # for all the relevant configuration, write a config-file and exit.
         if not os.path.exists(CONFIG_FILE):
+
+            # if running under systemd, print a hint and exit with an error.
+            # The hint then gets shown when running systemctl status matrix-ytdl
+            if IN_SYSTEMD:
+                print(f'Did not find {CONFIG_FILE}.')
+                print(f'Please run {PROG_WITHOUT_EXT} manually in order to perform first-time configuration')
+                sys.exit(1)
+
             print(f'First time use. Did not find {CONFIG_FILE}. Asking for '
                 'homeserver, user, and password to create credential file.')
             homeserver = 'https://matrix.example.org'
@@ -345,7 +354,7 @@ async def main(dl) -> None:
                 logger.error(f'Login failed at {homeserver} as "{user_id}": {resp}')
                 sys.exit(1)
 
-            logger.info(f'Logged in using a password. Credentials stored in "{CONFIG_FILE}"')
+            logger.info(f'Logged in using a password. Configuration stored in "{CONFIG_FILE}"')
 
         # Otherwise the config file exists, so we'll use the stored credentials
         else:
@@ -463,18 +472,18 @@ if __name__ == '__main__':
     # Setup logging
     logger = logging.getLogger(PROG_WITHOUT_EXT)
     logger.setLevel(logging.INFO)
-    if os.getenv('SYSTEMD_EXEC_PID') != str(os.getpid()):
-        # If not running in systemd, use stderr
-        log_format = '%(asctime)s %(levelname)-8s %(message)s'
-        formatter = logging.Formatter(log_format)
-        handler = logging.StreamHandler()
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-    else:
+    if IN_SYSTEMD:
         # If running in systemd, use syslog
         log_format = '%(message)s'
         formatter = logging.Formatter(log_format)
         handler = journal.JournalHandler(SYSLOG_IDENTIFIER = 'matrix-ytdl')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    else:
+        # If not running in systemd, use stderr
+        log_format = '%(asctime)s %(levelname)-8s %(message)s'
+        formatter = logging.Formatter(log_format)
+        handler = logging.StreamHandler()
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
