@@ -41,26 +41,30 @@ IN_SYSTEMD = os.getenv('SYSTEMD_EXEC_PID') == str(os.getpid())
 CONFIG_FILE = os.path.expanduser(os.getenv('CONFIG_FILE') or '~/.config/matrix-ytdl.json')
 SYNC_FILE = os.path.expanduser(os.getenv('SYNC_FILE') or '~/.cache/matrix-ytdl.since')
 
-class DummyLogger:
+class YtdlLogger:
     def debug(self, msg):
-        pass
+        #filter progress messages
+        if re.match('\[download\]\s+\d+(\.\d+)*% of ', msg):
+            return
+        logger.info(msg)
 
     def info(self, msg):
-        pass
+        logger.info(msg)
 
     def warning(self, msg):
-        pass
+        logger.warning(msg)
 
     def error(self, msg):
-        print(f'err: {msg}')
+        logger.error(msg)
 
 class Callbacks(object):
     """Class to pass client to callback methods."""
 
-    def __init__(self, client, config):
+    def __init__(self, client, config, dl):
         """Store AsyncClient."""
         self.client = client
         self.config = config
+        self.dl = dl
 
     async def sendroom(self, msg):
         if msg is None:
@@ -78,7 +82,7 @@ class Callbacks(object):
     async def sync_callback(self, response):
         with open(SYNC_FILE, 'w') as sf:
             sf.write(response.next_batch)
-        msg = dl.getdone()
+        msg = self.dl.getdone()
         if not msg is None:
             await self.sendroom(msg)
 
@@ -104,13 +108,13 @@ class Callbacks(object):
             if isinstance(event, RoomMessageNotice) or isinstance(event, RoomMessageText):
                 msg = event.body  # Extract the message text
                 if msg == 'status':
-                    await self.sendroom(dl.status())
+                    await self.sendroom(self.dl.status())
                     return
                 if msg.startswith('status https://'):
-                    await self.sendroom(dl.status(msg[7:]))
+                    await self.sendroom(self.dl.status(msg[7:]))
                     return
                 if msg.startswith('https://'):
-                    dl.add(msg, self.config['dstdir'])
+                    self.dl.add(msg, self.config['dstdir'])
                     await self.sendroom(f'Queued download of {msg}')
                     return
             elif isinstance(event, RoomMemberEvent):
@@ -145,11 +149,11 @@ class Ytdl():
         def __post_init__(self):
             dstdir = self.dstdir or '~/Downloads'
             self.dlopts = {
-                'quiet': True,
+                'quiet': False,
                 'format': 'bv+ba',
                 'merge_output_format': 'mkv',
                 'outtmpl': {'default': dstdir + '/%(title)s.%(ext)s'},
-                'logger': DummyLogger(),
+                'logger': YtdlLogger(),
                 'progress_hooks': [self.hook],
                 'postprocessor_hooks': [self.phook]
             }
@@ -286,10 +290,10 @@ def remove_member(userid) -> None:
         with open(CONFIG_FILE, 'w') as nf:
             json.dump(tmp, nf, indent = 4)
 
-async def listen_forever(client: AsyncClient, config) -> None:
+async def listen_forever(client: AsyncClient, config, dl: Ytdl) -> None:
     """Listen forever or until Control-C."""
     # Set up event callbacks
-    callbacks = Callbacks(client, config)
+    callbacks = Callbacks(client, config, dl)
     client.add_event_callback(
         callbacks.message_callback,
         (
@@ -410,7 +414,7 @@ async def main(dl) -> None:
 
                 logger.info('Waiting for messages ...')
                 logger.debug(f'client={client}')
-                await listen_forever(client, config)
+                await listen_forever(client, config, dl)
     finally:
         if client:
             await client.close()
@@ -516,7 +520,6 @@ if __name__ == '__main__':
         if pargs.log_level and len(pargs.log_level) > 0:
             logger.warning('Debug option -d overwrote option --log-level.')
 
-    global dl
     dl = Ytdl()
     thr = Thread(target = dl.worker)
     thr.start()
