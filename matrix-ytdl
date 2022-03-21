@@ -162,13 +162,14 @@ class Ytdl():
         def __post_init__(self):
             dstdir = self.dstdir or '~/Downloads'
             self.dlopts = {
-                'quiet': False,
+                'quiet': True,
                 'format': self.fmt or 'bv+ba',
                 'merge_output_format': 'mkv',
                 'outtmpl': {'default': dstdir + '/%(title)s.%(ext)s'},
                 'logger': YtdlLogger(),
                 'progress_hooks': [self.hook],
-                'postprocessor_hooks': [self.phook]
+                'postprocessor_hooks': [self.phook],
+                'postprocessors': [{'key':'FFmpegMetadata','when':'after_move'}]
             }
 
         def hook(self, d):
