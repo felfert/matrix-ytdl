@@ -114,8 +114,20 @@ class Callbacks(object):
                     await self.sendroom(self.dl.status(msg[7:]))
                     return
                 if msg.startswith('https://'):
-                    self.dl.add(msg, self.config['dstdir'])
-                    await self.sendroom(f'Queued download of {msg}')
+                    al = msg.split()
+                    url = al[0]
+                    fmt = ' '.join(al[1:])
+                    if fmt == '':
+                        fmt = None
+                    elif fmt == '720':
+                        fmt = 'bv[height<=?720]+ba'
+                    elif fmt == '1024':
+                        fmt = 'bv[height<=?720]+ba'
+                    self.dl.add(url, fmt, self.config['dstdir'])
+                    if fmt is None:
+                        await self.sendroom(f'Queued download of {url}')
+                    else:
+                        await self.sendroom(f'Queued download of {url} with format {fmt}')
                     return
             elif isinstance(event, RoomMemberEvent):
                 if event.membership == 'leave':
@@ -140,6 +152,7 @@ class Ytdl():
     class QueueElement:
         url: str
         done: Queue
+        fmt: str = None
         dstdir: str = field(default = '~/Downloads')
         percent: str = field(default = '0 %')
         status: str = field(default = 'pending')
@@ -150,7 +163,7 @@ class Ytdl():
             dstdir = self.dstdir or '~/Downloads'
             self.dlopts = {
                 'quiet': False,
-                'format': 'bv+ba',
+                'format': self.fmt or 'bv+ba',
                 'merge_output_format': 'mkv',
                 'outtmpl': {'default': dstdir + '/%(title)s.%(ext)s'},
                 'logger': YtdlLogger(),
@@ -189,8 +202,8 @@ class Ytdl():
         self.loading = Queue()
         self.done = Queue()
 
-    def add(self, url, dstdir = None):
-        el = self.QueueElement(url, self.done, dstdir)
+    def add(self, url, fmt = None, dstdir = None):
+        el = self.QueueElement(url, self.done, fmt, dstdir)
         self.queue.put(el)
 
     def getdone(self):
