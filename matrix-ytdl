@@ -290,7 +290,7 @@ def write_details_to_disk(resp: LoginResponse, homeserver, room, dstdir) -> None
 def update_config(config) -> None:
     with open(CONFIG_FILE, 'r') as f:
         tmp = json.load(f)
-        for attr, value in config.__dict__.items():
+        for attr, value in config.items():
             tmp[attr] = value
         with open(CONFIG_FILE, 'w') as nf:
             json.dump(tmp, nf, indent = 4)
@@ -360,6 +360,7 @@ async def main(dl) -> None:
             dstdir = '~/Downloads'
             dstdir = input(f'Choose a destination directory: [{dstdir}] ') or dstdir
 
+            logger.debug(f'homeserver={homeserver}, user_id={user_id} device_name={device_name} room_name={room_name} dstdir={dstdir}')
             client = AsyncClient(homeserver, user_id)
             pw = getpass.getpass()
 
