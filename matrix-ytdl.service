@@ -1,0 +1,17 @@
+[Unit]
+Description=Matrix bot for Youtube-download
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=25
+
+[Service]
+Environment=CONFIG_FILE=/etc/matrix-ytdl/config.json
+Environment=SYNC_FILE=/var/cache/matrix-ytdl/cache.since
+User=ytdl
+Group=ytdl
+WorkingDirectory=~
+ExecStart=/usr/bin/matrix-ytdl
+
+[Install]
+WantedBy=multi-user.target

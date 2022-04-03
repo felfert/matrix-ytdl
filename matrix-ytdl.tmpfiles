@@ -1,0 +1,5 @@
+# create rundir
+d /run/matrix-ytdl 0755 matrix-ytdl matrix-ytdl -
+# Set permissions on config dir and cache dir
+z /etc/matrix-ytdl 0750 matrix-ytdl matrix-ytdl
+z /var/cache/matrix-ytdl 0750 matrix-ytdl matrix-ytdl
